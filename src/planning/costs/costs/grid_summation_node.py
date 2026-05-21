@@ -1,4 +1,5 @@
 '''
+
 Package: grids
    File: grid_summation_node.py
  Author: Will Heitman (w at heit dot mn)
