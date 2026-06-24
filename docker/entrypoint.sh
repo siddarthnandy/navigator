@@ -23,6 +23,18 @@ source /opt/ros/humble/setup.bash
 echo "🧭 Sourcing Navigator..."
 source /navigator/install/setup.bash
 
+# The aggregate install/setup.bash above doesn't always pick up packages
+# built later with `colcon build --packages-select` (it's only regenerated
+# by a full colcon build). autonomous_cruise hits this regularly, which
+# makes `ros2 launch launches/launch.carla.py` abort the entire launch with
+# "package 'autonomous_cruise' not found". Export its hooks directly so this
+# can't silently break the whole stack.
+export AMENT_PREFIX_PATH="/navigator/install/autonomous_cruise:${AMENT_PREFIX_PATH}"
+export PYTHONPATH="/navigator/install/autonomous_cruise/lib/python3.10/site-packages:${PYTHONPATH}"
+
+echo "🧠 Installing perception (mmseg/PSPNet) dependencies..."
+pip3 install -q mmsegmentation ftfy regex 2>&1 | tail -3
+
 # echo "🔌 Setting up CARLA API..."
 # export CARLA_ROOT="/workspace/simulator"
 # export SCENARIO_RUNNER_ROOT="/workspace/scenario_runner"

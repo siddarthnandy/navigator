@@ -41,7 +41,7 @@ def generate_launch_description():
         # lane_type_detector,
         # pedestrian_skeleton
         # road_user_detector,      # YOLO model required - disabled until model present
-        # image_segmentation,      # mmseg/PSPNet required - disabled until installed
+        image_segmentation,         # mmseg/PSPNet — installed by docker/entrypoint.sh on startup
         ground_seg,
         static_grid,
         hybrid_grid,

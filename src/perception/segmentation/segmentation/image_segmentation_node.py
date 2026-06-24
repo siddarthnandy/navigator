@@ -4,6 +4,15 @@ Runs PSPNet (mmseg v1.x) on 4 CARLA cameras in a round-robin background thread.
 Callbacks only store the latest frame — no blocking inference in the spin thread.
 """
 
+import torch
+# PyTorch defaults to using half the machine's cores for CPU inference
+# (32 threads on this 64-core box). With no GPU available here, that was
+# pegging the whole machine at load average ~40, starving CARLA's own
+# engine/physics and the rest of the ROS stack when multiple stacks were
+# running. With a single clean stack, 16 gives faster inference per camera
+# while leaving plenty of headroom for everything else.
+torch.set_num_threads(16)
+
 import threading
 import rclpy
 from rclpy.node import Node
@@ -63,6 +72,22 @@ class ImageSegmentationNode(Node):
         self.get_logger().info('Loading PSPNet on CPU…')
         self.model  = init_model(_CONFIG, _CKPT, device='cpu')
         self.bridge = CvBridge()
+
+        # The model's test pipeline resizes (keep_ratio=True) toward a
+        # (2048, 1024) bounding box by default -- sized for full Cityscapes
+        # photos. Our CARLA cameras are 800x600, so this was actually
+        # *upscaling* every frame to ~1365x1024 before inference, paying
+        # compute for detail the camera never had. inference_model() rebuilds
+        # its pipeline from model.cfg.test_pipeline on every call (not cached
+        # at load time -- see mmseg/apis/utils.py:_preprare_data), so this
+        # mutation applies to all future calls. The downstream consumer is a
+        # coarse 300x300 / 0.2m grid, so this costs negligible real-world
+        # detail while cutting inference time substantially.
+        for step in self.model.cfg.test_pipeline:
+            if step.get('type') == 'Resize':
+                step['scale'] = (400, 300)
+                self.get_logger().info(f'Overrode inference resize scale to {step["scale"]}')
+
         self.get_logger().info('PSPNet ready.')
 
         image_qos = QoSProfile(

@@ -2,37 +2,18 @@
 """
 hybrid_drivable_grid_node.py
 
-Fuses the perception-based drivable grid, the HD-map, and the hybrid occupancy
-grid to produce a real-time /grid/drivable OccupancyGrid.
+Publishes /grid/drivable directly from the perception-based drivable grid.
 
-Perception is the PRIMARY source.  HD map is a FALLBACK for cells where
-perception is uncertain.  Occupancy grid provides real-time obstacle veto.
-
-Fusion rules (per cell, in priority order):
-  1. Perception high-confidence road (perc_occ < PERC_ROAD_THRESHOLD, i.e. evidence > 0.70)
-       -> open as road (0), regardless of HD map.
-       -> Perception has seen this cell clearly; HD map boundaries do not override.
-  2. Perception uncertain (perc_occ >= PERC_ROAD_THRESHOLD)
-       -> fall back to HD map:
-            HD map == 0   (mapped road)    -> road (0)
-            HD map other  (boundary/unknown)-> obstacle (100), safe default
-  3. No perception data yet (startup / topic gap)
-       -> full HD map fallback, identical to previous behaviour.
-  4. Occupancy grid obstacle veto applied last on all confirmed road cells:
-       occ >= OCC_BLOCK_THRESHOLD -> blocked (100)
-       0 < occ < threshold        -> hazard value passed through
-
-This gives three-layer failsafe with correct priority:
-  Perception (10 Hz, map-free)  — primary
-  HD map (slow, map-dependent)  — fallback when perception is uncertain
-  Occupancy (LiDAR+camera obs)  — real-time obstacle veto
-
-No downstream changes: /grid/drivable topic and OccupancyGrid format unchanged.
+PERCEPTION-ONLY: the MapManager/HD-map fallback has been removed on request.
+Previously this node started from the HD map as a base layer and only let
+perception OPEN cells (never close them), falling back to HD map wherever
+perception was uncertain. That meant /grid/drivable was effectively
+MapManager-driven everywhere perception hadn't directly confirmed a cell.
+Now it's a straight passthrough of /grid/drivable/segmented (resized to
+300x300 if needed) — no HD map subscription, no fallback.
 
 Inputs:
-  /grid/drivable/segmented     PerceptionDrivableGridNode  (primary)
-  /grid/drivable/hdmap         MapManager OccupancyGrid    (fallback, remapped in launch)
-  /grid/occupancy/current      HybridPerceptionGridNode    (obstacle veto)
+  /grid/drivable/segmented     PerceptionDrivableGridNode  (only source)
 
 Output:
   /grid/drivable               300x300 OccupancyGrid, 0.2m/cell, base_link
@@ -44,12 +25,7 @@ import rclpy
 from rclpy.node    import Node
 from nav_msgs.msg  import OccupancyGrid
 
-# Occupancy value at or above which a confirmed road cell is treated as blocked.
-OCC_BLOCK_THRESHOLD = np.int8(80)
-
-# Perception occupancy BELOW this threshold → high-confidence road.
-# Evidence > 0.70 (occupancy < 30).  Only these cells can override HD map
-# boundaries.  Speckles / uncertain cells (occ >= 30) fall back to HD map.
+# Perception occupancy BELOW this threshold → high-confidence road, open to 0.
 PERC_ROAD_THRESHOLD = np.int8(30)
 
 
@@ -59,37 +35,23 @@ class HybridDrivableGridNode(Node):
         super().__init__('hybrid_drivable_grid_node')
         self._lock = threading.Lock()
 
-        self._hdmap: np.ndarray | None  = None
-        self._perc:  np.ndarray | None  = None   # /grid/drivable/segmented
+        self._perc: np.ndarray | None = None   # /grid/drivable/segmented
 
-        qos1 = rclpy.qos.QoSProfile(
-            reliability=rclpy.qos.QoSReliabilityPolicy.RELIABLE,
-            history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST, depth=1)
         qos_be = rclpy.qos.QoSProfile(
             reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT,
             history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST, depth=1)
 
-        self.create_subscription(OccupancyGrid, '/grid/drivable/hdmap',
-            self._cb_hdmap, qos1)
         self.create_subscription(OccupancyGrid, '/grid/drivable/segmented',
             self._cb_perc, qos_be)
 
         self.pub = self.create_publisher(OccupancyGrid, '/grid/drivable', 10)
 
-        self.create_timer(0.1, self._publish_loop)
+        # 20-Hz (matches route_costmap_node, which reads this for goal selection)
+        self.create_timer(0.05, self._publish_loop)
 
-        self._last_hdmap_stamp = None
-
-        self.get_logger().info('HybridDrivableGridNode ready — perception-primary, HD map fallback.')
+        self.get_logger().info('HybridDrivableGridNode ready — perception-only (MapManager/HD-map fallback removed).')
 
     # -------------------------------------------------------------------------
-
-    def _cb_hdmap(self, msg: OccupancyGrid):
-        arr = np.array(msg.data, dtype=np.int8).reshape(
-            msg.info.height, msg.info.width)
-        with self._lock:
-            self._hdmap = arr
-            self._last_hdmap_stamp = msg.header.stamp
 
     def _cb_perc(self, msg: OccupancyGrid):
         arr = np.array(msg.data, dtype=np.int8).reshape(
@@ -101,12 +63,11 @@ class HybridDrivableGridNode(Node):
 
     def _publish_loop(self):
         with self._lock:
-            hdmap = self._hdmap.copy() if self._hdmap is not None else None
-            perc  = self._perc.copy()  if self._perc  is not None else None
+            perc = self._perc.copy() if self._perc is not None else None
 
-        if perc is None and hdmap is None:
+        if perc is None:
             self.get_logger().warn(
-                'No perception or HD map data yet.', throttle_duration_sec=5.0)
+                'No perception data yet.', throttle_duration_sec=5.0)
             return
 
         # ── helper: resize any grid to 300×300 ───────────────────────────────
@@ -120,34 +81,12 @@ class HybridDrivableGridNode(Node):
                               (target_shape[1], target_shape[0]),
                               interpolation=cv2.INTER_NEAREST).astype(np.int8)
 
-        if perc is not None:
-            perc = _resize(perc)
+        perc = _resize(perc)
 
-        if hdmap is not None:
-            hdmap = _resize(hdmap)
-
-        # ── step 1: build base drivability ───────────────────────────────────
-        # Start from HD map as the base (preserves all mapped road/boundary/unknown
-        # values exactly as before). Perception can only OPEN cells — it never adds
-        # new obstacles. Obstacle detection is the occupancy grid's job (step 2).
-        # This ensures unmapped/uncertain areas keep their HD map values and the
-        # path planner always has a navigable route through mapped road.
-        if hdmap is not None:
-            output = hdmap.copy()
-        else:
-            # No HD map — start permissive (unknown=50) so planner can still route
-            output = np.full(target_shape, np.int8(50), dtype=np.int8)
-
-        if perc is not None:
-            # High-confidence perception road → open, overrides HD map boundaries
-            # This extends drivable area into unmapped/uncharted road.
-            output[perc < PERC_ROAD_THRESHOLD] = np.int8(0)
-            # Uncertain perception cells: HD map base is preserved unchanged.
-            # Perception does NOT close cells — no new obstacles from perception.
-        else:
-            self.get_logger().warn(
-                'Perception grid not yet received, using HD map only.',
-                throttle_duration_sec=10.0)
+        # High-confidence perception road → open to 0. Everything else passes
+        # through the perception grid's own values unchanged (no HD map base).
+        output = perc.copy()
+        output[perc < PERC_ROAD_THRESHOLD] = np.int8(0)
 
         # NOTE: No occupancy veto here.
         # /grid/occupancy/current already flows into grid_summation_node as its
