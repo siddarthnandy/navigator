@@ -79,7 +79,8 @@ def generate_launch_description():
                         path_planner,
                         # *nav2_launch_entities,
                         # path_planner_nav2,
-                        autonomous_cruise_controller,
+                        pure_pursuit_controller,
+                        # autonomous_cruise_controller,  # disabled 2026-07-02: switched to pure pursuit for lane-grid testing
                         # SAFETY
                         ##airbags,
                         ##guardian,

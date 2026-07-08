@@ -103,7 +103,7 @@ class RouteCostmapNode(Node):
         # reaching for it let the goal snap several metres between ticks.
         # Matches the old LiDAR-only behaviour: a short, continuously
         # updated target only as far as can be reliably confirmed right now.
-        self._max_goal_ahead_m = 8.0
+        self._max_goal_ahead_m = 35.0
 
     def clockCb(self, msg: Clock):
         self.clock = msg
@@ -348,7 +348,7 @@ class RouteCostmapNode(Node):
             # detour around it; it just stopped short. A gap that doesn't
             # resolve within that distance is treated as the genuine edge of
             # known road, same as before.
-            MAX_GAP_M = 2.0
+            MAX_GAP_M = 3.0
             goal = None
             gap_start = None
             for r in range(len(gridxs)):
